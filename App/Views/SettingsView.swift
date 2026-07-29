@@ -81,6 +81,27 @@ struct GeneralSettingsView: View {
 
     var body: some View {
         Form {
+            // 开机自启
+            Section {
+                HStack {
+                    Text("Launch at Login")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Toggle(
+                        "",
+                        isOn: Binding(
+                            get: { serverController.launchAtLogin },
+                            set: { serverController.launchAtLogin = $0 }
+                        )
+                    )
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                }
+            } footer: {
+                Text("iMCP will automatically start when you log in to your Mac.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {

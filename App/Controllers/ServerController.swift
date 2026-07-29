@@ -4,6 +4,7 @@ import MCP
 import Network
 import OSLog
 import Ontology
+import ServiceManagement
 import SwiftUI
 import SystemPackage
 import UserNotifications
@@ -601,6 +602,30 @@ final class ServerController: ObservableObject {
     func getHTTPConnectionURL() -> String? {
         guard let ip = getLocalIPAddress() else { return nil }
         return "http://\(ip):\(httpPort)/mcp"
+    }
+
+    // MARK: - Launch at Login
+
+    /// 开机自启状态
+    var launchAtLogin: Bool {
+        get {
+            if #available(macOS 13.0, *) {
+                return SMAppService.mainApp.status == .enabled
+            }
+            return false
+        }
+        set {
+            guard #available(macOS 13.0, *) else { return }
+            do {
+                if newValue {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try SMAppService.mainApp.unregister()
+                }
+            } catch {
+                log.error("Failed to update launch at login: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func updateServerStatus(_ status: String) {
