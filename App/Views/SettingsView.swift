@@ -6,12 +6,14 @@ struct SettingsView: View {
 
     enum SettingsSection: String, CaseIterable, Identifiable {
         case general = "General"
+        case http = "HTTP MCP"
 
         var id: String { self.rawValue }
 
         var icon: String {
             switch self {
             case .general: return "gear"
+            case .http: return "network"
             }
         }
     }
@@ -39,6 +41,10 @@ struct SettingsView: View {
                 case .general:
                     GeneralSettingsView(serverController: serverController)
                         .navigationTitle("General")
+                        .formStyle(.grouped)
+                case .http:
+                    HTTPSettingsView(serverController: serverController)
+                        .navigationTitle("HTTP MCP")
                         .formStyle(.grouped)
                 }
             } else {
@@ -138,6 +144,159 @@ struct GeneralSettingsView: View {
             Text(
                 "This will remove all trusted clients. They will need to be approved again when connecting."
             )
+        }
+    }
+}
+
+// MARK: - HTTP MCP Settings
+
+struct HTTPSettingsView: View {
+    @ObservedObject var serverController: ServerController
+    @State private var portText: String = ""
+    @State private var showingRegenerateAlert = false
+    @State private var copiedAPIKey = false
+    @State private var copiedURL = false
+
+    var body: some View {
+        Form {
+            // 服务器状态
+            Section {
+                HStack {
+                    Text("Server Status")
+                    Spacer()
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(
+                                serverController.httpServerStatus == "Running"
+                                    ? Color.green : Color.red
+                            )
+                            .frame(width: 8, height: 8)
+                        Text(serverController.httpServerStatus)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let url = serverController.httpConnectionURL {
+                    HStack {
+                        Text("Connection URL")
+                        Spacer()
+                        HStack(spacing: 4) {
+                            Text(url)
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+
+                            Button {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(url, forType: .string)
+                                copiedURL = true
+                                Task {
+                                    try? await Task.sleep(for: .seconds(2))
+                                    copiedURL = false
+                                }
+                            } label: {
+                                Image(systemName: copiedURL ? "checkmark" : "doc.on.doc")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Copy URL")
+                        }
+                    }
+                }
+            } header: {
+                Text("Status")
+
+            } footer: {
+                Text(
+                    "Clients on the local network can connect to this MCP server using the URL above."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            // API Key
+            Section {
+                HStack {
+                    Text("API Key")
+                    Spacer()
+                    HStack(spacing: 4) {
+                        SecureField("API Key", text: .constant(serverController.getAPIKey()))
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .disabled(true)
+
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(
+                                serverController.getAPIKey(), forType: .string)
+                            copiedAPIKey = true
+                            Task {
+                                try? await Task.sleep(for: .seconds(2))
+                                copiedAPIKey = false
+                            }
+                        } label: {
+                            Image(systemName: copiedAPIKey ? "checkmark" : "doc.on.doc")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Copy API Key")
+                    }
+                }
+
+                Button("Regenerate API Key") {
+                    showingRegenerateAlert = true
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.red)
+            } header: {
+                Text("Authentication")
+            } footer: {
+                Text(
+                    "Use this API key with 'Authorization: Bearer <key>' or 'x-api-key' header when connecting to the server."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            // 端口配置
+            Section {
+                HStack {
+                    Text("Port")
+                    Spacer()
+                    TextField("Port", text: $portText)
+                        .frame(width: 80)
+                        .onAppear {
+                            portText = String(serverController.getHTTPPort())
+                        }
+                }
+
+                Button("Apply") {
+                    if let port = Int(portText), port > 0, port <= 65535 {
+                        Task {
+                            await serverController.setHTTPPort(port)
+                        }
+                    }
+                }
+                .disabled(portText == String(serverController.getHTTPPort()))
+            } header: {
+                Text("Port Configuration")
+            } footer: {
+                Text("Changing the port will restart the HTTP MCP server.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .alert("Regenerate API Key", isPresented: $showingRegenerateAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Regenerate", role: .destructive) {
+                Task {
+                    await serverController.regenerateAPIKey()
+                }
+            }
+        } message: {
+            Text("This will invalidate the current API key. All clients will need the new key to connect.")
         }
     }
 }

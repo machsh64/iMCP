@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import MCP
 import Network
 import OSLog
@@ -154,6 +155,8 @@ enum ServiceRegistry {
 @MainActor
 final class ServerController: ObservableObject {
     @Published var serverStatus: String = "Starting..."
+    @Published var httpServerStatus: String = "Starting..."
+    @Published var httpConnectionURL: String?
     @Published var pendingConnectionID: String?
     @Published var pendingClientName: String = ""
 
@@ -178,6 +181,13 @@ final class ServerController: ObservableObject {
 
     // MARK: - AppStorage for Trusted Clients
     @AppStorage("trustedClients") private var trustedClientsData = Data()
+
+    // MARK: - AppStorage for HTTP Server Configuration
+    @AppStorage("httpPort") private var httpPort = 8080
+    @AppStorage("httpAPIKey") private var httpAPIKey = ""
+
+    // MARK: - HTTP MCP Server
+    private var httpServer: HTTPMCPServer?
 
     // MARK: - Computed Properties for Service Configurations and Bindings
     var computedServiceConfigs: [ServiceConfig] {
@@ -263,10 +273,18 @@ final class ServerController: ObservableObject {
 
     init() {
         Task {
+            // 初始化 API key（首次运行时自动生成）
+            if httpAPIKey.isEmpty {
+                httpAPIKey = Self.generateAPIKey()
+            }
+
             // Initialize bindings from AppStorage before the server starts.
             await networkManager.updateServiceBindings(self.currentServiceBindings)
             await self.networkManager.start()
             self.updateServerStatus("Running")
+
+            // 启动 HTTP MCP 服务器
+            await startHTTPServer()
 
             await networkManager.setConnectionApprovalHandler {
                 [weak self] connectionID, clientInfo in
@@ -318,6 +336,271 @@ final class ServerController: ObservableObject {
     func setEnabled(_ enabled: Bool) async {
         await networkManager.setEnabled(enabled)
         updateServerStatus(enabled ? "Running" : "Disabled")
+    }
+
+    // MARK: - HTTP MCP Server Management
+
+    /// 启动 HTTP MCP 服务器
+    private func startHTTPServer() async {
+        guard httpServer == nil else { return }
+
+        let server = HTTPMCPServer(
+            port: httpPort,
+            host: "0.0.0.0",
+            endpoint: "/mcp",
+            apiKey: httpAPIKey,
+            serverFactory: { [weak self] sessionID, transport in
+                let server = MCP.Server(
+                    name: Bundle.main.name ?? "iMCP",
+                    version: Bundle.main.shortVersionString ?? "unknown",
+                    capabilities: MCP.Server.Capabilities(
+                        tools: .init(listChanged: true)
+                    )
+                )
+
+                guard let self else { return server }
+                await self.registerHTTPHandlers(for: server, sessionID: sessionID)
+                return server
+            }
+        )
+
+        do {
+            try await server.start()
+            httpServer = server
+            httpServerStatus = "Running"
+            httpConnectionURL = getHTTPConnectionURL()
+            log.notice("HTTP MCP server started on port \(self.httpPort)")
+        } catch {
+            httpServerStatus = "Failed: \(error.localizedDescription)"
+            log.error("Failed to start HTTP MCP server: \(error.localizedDescription)")
+        }
+    }
+
+    /// 停止 HTTP MCP 服务器
+    func stopHTTPServer() async {
+        await httpServer?.stop()
+        httpServer = nil
+        httpServerStatus = "Stopped"
+        httpConnectionURL = nil
+    }
+
+    /// 重启 HTTP MCP 服务器（用于端口或 API key 变更后）
+    func restartHTTPServer() async {
+        httpServerStatus = "Restarting..."
+        await stopHTTPServer()
+        await startHTTPServer()
+    }
+
+    /// 为 HTTP MCP 服务器注册工具处理器
+    private func registerHTTPHandlers(for server: MCP.Server, sessionID: String) async {
+        await server.withMethodHandler(ListPrompts.self) { _ in
+            return ListPrompts.Result(prompts: [])
+        }
+
+        await server.withMethodHandler(ListResources.self) { _ in
+            return ListResources.Result(resources: [])
+        }
+
+        let services = ServiceRegistry.services
+        let bindings = currentServiceBindings
+
+        await server.withMethodHandler(ListTools.self) { _ in
+            var tools: [MCP.Tool] = []
+            for service in services {
+                let serviceId = String(describing: type(of: service))
+                if let isServiceEnabled = bindings[serviceId]?.wrappedValue,
+                    isServiceEnabled
+                {
+                    for tool in service.tools {
+                        tools.append(
+                            .init(
+                                name: tool.name,
+                                description: tool.description,
+                                inputSchema: try Value(tool.inputSchema),
+                                annotations: tool.annotations
+                            )
+                        )
+                    }
+                }
+            }
+
+            return ListTools.Result(tools: tools)
+        }
+
+        await server.withMethodHandler(CallTool.self) { params in
+            log.notice("HTTP tool call from \(sessionID): \(params.name)")
+
+            for service in services {
+                let serviceId = String(describing: type(of: service))
+                if let isServiceEnabled = bindings[serviceId]?.wrappedValue,
+                    isServiceEnabled
+                {
+                    do {
+                        guard
+                            let value = try await service.call(
+                                tool: params.name,
+                                with: params.arguments ?? [:]
+                            )
+                        else {
+                            continue
+                        }
+
+                        log.notice("HTTP tool \(params.name) executed successfully")
+                        switch value {
+                        case .data(let mimeType?, let data) where mimeType.hasPrefix("audio/"):
+                            return CallTool.Result(
+                                content: [
+                                    .audio(
+                                        data: data.base64EncodedString(),
+                                        mimeType: mimeType,
+                                        annotations: nil,
+                                        _meta: nil
+                                    )
+                                ],
+                                isError: false
+                            )
+                        case .data(let mimeType?, let data) where mimeType.hasPrefix("image/"):
+                            return CallTool.Result(
+                                content: [
+                                    .image(
+                                        data: data.base64EncodedString(),
+                                        mimeType: mimeType,
+                                        annotations: nil,
+                                        _meta: nil
+                                    )
+                                ],
+                                isError: false
+                            )
+                        default:
+                            let encoder = JSONEncoder()
+                            encoder.userInfo[Ontology.DateTime.timeZoneOverrideKey] =
+                                TimeZone.current
+                            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+
+                            let data = try encoder.encode(value)
+                            let text = String(data: data, encoding: .utf8)!
+
+                            return CallTool.Result(
+                                content: [.text(text: text, annotations: nil, _meta: nil)],
+                                isError: false
+                            )
+                        }
+                    } catch {
+                        log.error(
+                            "HTTP tool \(params.name) error: \(error.localizedDescription)"
+                        )
+                        return CallTool.Result(
+                            content: [.text(text: "Error: \(error)", annotations: nil, _meta: nil)],
+                            isError: true
+                        )
+                    }
+                }
+            }
+
+            return CallTool.Result(
+                content: [
+                    .text(
+                        text: "Tool not found: \(params.name)",
+                        annotations: nil,
+                        _meta: nil
+                    )
+                ],
+                isError: true
+            )
+        }
+    }
+
+    // MARK: - API Key Management
+
+    /// 生成随机 API key
+    private static func generateAPIKey() -> String {
+        let characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        let keyLength = 32
+        var key = "imcp-"
+        for _ in 0..<keyLength {
+            if let char = characters.randomElement() {
+                key.append(char)
+            }
+        }
+        return key
+    }
+
+    /// 获取当前 API key
+    func getAPIKey() -> String {
+        httpAPIKey
+    }
+
+    /// 重新生成 API key 并重启服务器
+    func regenerateAPIKey() async {
+        httpAPIKey = Self.generateAPIKey()
+        if httpServer != nil {
+            await restartHTTPServer()
+        }
+    }
+
+    /// 获取 HTTP 端口
+    func getHTTPPort() -> Int {
+        httpPort
+    }
+
+    /// 设置 HTTP 端口并重启服务器
+    func setHTTPPort(_ port: Int) async {
+        guard port > 0, port <= 65535, port != httpPort else { return }
+        httpPort = port
+        if httpServer != nil {
+            await restartHTTPServer()
+        }
+    }
+
+    /// 获取 HTTP 服务器运行状态
+    func getHTTPStatus() async -> String {
+        guard let httpServer else { return "Stopped" }
+        return await httpServer.isServerRunning ? "Running" : "Stopped"
+    }
+
+    /// 获取本机局域网 IP 地址
+    func getLocalIPAddress() -> String? {
+        var address: String?
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+
+        var ptr = firstAddr
+        while true {
+            let flags = Int32(ptr.pointee.ifa_flags)
+            let addr = ptr.pointee.ifa_addr.pointee
+            if addr.sa_family == UInt8(AF_INET),
+                (flags & (IFF_UP | IFF_RUNNING | IFF_LOOPBACK)) == (IFF_UP | IFF_RUNNING)
+            {
+                var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(
+                    ptr.pointee.ifa_addr,
+                    socklen_t(addr.sa_len),
+                    &hostname,
+                    socklen_t(hostname.count),
+                    nil,
+                    0,
+                    NI_NUMERICHOST
+                ) == 0
+                {
+                    let ip = String(cString: hostname)
+                    if !ip.hasPrefix("127.") {
+                        address = ip
+                        break
+                    }
+                }
+            }
+            guard let next = ptr.pointee.ifa_next else { break }
+            ptr = next
+        }
+
+        return address
+    }
+
+    /// 获取 HTTP MCP 连接 URL
+    func getHTTPConnectionURL() -> String? {
+        guard let ip = getLocalIPAddress() else { return nil }
+        return "http://\(ip):\(httpPort)/mcp"
     }
 
     private func updateServerStatus(_ status: String) {
