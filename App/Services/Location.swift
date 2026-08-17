@@ -6,6 +6,37 @@ import Ontology
 private let log = Logger.service("location")
 
 final class LocationService: NSObject, Service, CLLocationManagerDelegate {
+    /// 保护 latestLocation 和 authorizationContinuation 的并发访问
+    private let stateLock = NSLock()
+    private var _latestLocation: CLLocation?
+    private var _authorizationContinuation: CheckedContinuation<Void, Error>?
+
+    private var latestLocation: CLLocation? {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _latestLocation
+        }
+        set {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            _latestLocation = newValue
+        }
+    }
+
+    private var authorizationContinuation: CheckedContinuation<Void, Error>? {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _authorizationContinuation
+        }
+        set {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            _authorizationContinuation = newValue
+        }
+    }
+
     private let locationManager = {
         let manager = CLLocationManager()
         manager.activityType = .other
@@ -14,8 +45,6 @@ final class LocationService: NSObject, Service, CLLocationManagerDelegate {
         manager.pausesLocationUpdatesAutomatically = true
         return manager
     }()
-    private var latestLocation: CLLocation?
-    private var authorizationContinuation: CheckedContinuation<Void, Error>?
 
     static let shared = LocationService()
 

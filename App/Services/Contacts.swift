@@ -327,5 +327,66 @@ final class ContactsService: Service {
 
             return Person(newContact)
         }
+
+        Tool(
+            name: "contacts_delete",
+            description:
+                "Delete a contact by its identifier.",
+            inputSchema: .object(
+                properties: [
+                    "identifier": .string(
+                        description: "Unique identifier of the contact to delete"
+                    )
+                ],
+                required: ["identifier"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Delete Contact",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            guard case let .string(identifier) = arguments["identifier"], !identifier.isEmpty else {
+                throw NSError(
+                    domain: "ContactsService",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Valid contact identifier required"]
+                )
+            }
+
+            // Fetch the mutable copy of the contact
+            let predicate = CNContact.predicateForContacts(withIdentifiers: [identifier])
+            let contact =
+                try await self.runContactStore {
+                    try self.contactStore.unifiedContacts(matching: predicate, keysToFetch: contactKeys)
+                }
+                .first?
+                .mutableCopy() as? CNMutableContact
+
+            guard let contactToDelete = contact else {
+                throw NSError(
+                    domain: "ContactsService",
+                    code: 2,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Contact not found with identifier: \(identifier)"
+                    ]
+                )
+            }
+
+            // Create a save request and delete the contact
+            let saveRequest = CNSaveRequest()
+            saveRequest.delete(contactToDelete)
+
+            try await self.runContactStore {
+                try self.contactStore.execute(saveRequest)
+            }
+
+            return Value.object([
+                "deleted": .bool(true),
+                "identifier": .string(identifier),
+            ])
+        }
     }
 }

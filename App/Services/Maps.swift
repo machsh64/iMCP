@@ -24,15 +24,14 @@ final class MapsService: NSObject, Service {
 
     var isActivated: Bool {
         get async {
-            // MapKit doesn't require explicit permission, but we rely on location
-            return await LocationService.shared.isActivated
+            // MapKit 本身不需要系统权限，工具接受显式坐标/地址，不依赖定位
+            return true
         }
     }
 
     func activate() async throws {
         log.debug("Activating maps service")
-        // Maps service depends on location service being active
-        try await LocationService.shared.activate()
+        // MapKit 不需要激活任何权限
     }
 
     var tools: [Tool] {

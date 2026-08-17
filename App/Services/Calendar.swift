@@ -333,8 +333,37 @@ final class CalendarService: Service {
                             ]
                         )
                     ),
-                    "hasAlarms": .boolean(),
-                    "isRecurring": .boolean(),
+                    "recurrence": .object(
+                        description: "Recurrence rule for the event",
+                        properties: [
+                            "frequency": .string(
+                                description: "How often the event recurs",
+                                enum: ["daily", "weekly", "monthly", "yearly"]
+                            ),
+                            "interval": .integer(
+                                description: "Interval between recurrences (default: 1, e.g. 2 = every 2 weeks)"
+                            ),
+                            "end": .string(
+                                description: "Optional end date for recurrence (ISO 8601)",
+                                format: .dateTime
+                            ),
+                            "occurrenceCount": .integer(
+                                description: "Optional number of occurrences before stopping"
+                            ),
+                            "daysOfWeek": .array(
+                                description:
+                                    "For weekly recurrence: days of week (1=Sunday ... 7=Saturday)",
+                                items: .integer(minimum: 1, maximum: 7)
+                            ),
+                            "daysOfMonth": .array(
+                                description:
+                                    "For monthly recurrence: days of month (1-31)",
+                                items: .integer(minimum: 1, maximum: 31)
+                            ),
+                        ],
+                        required: ["frequency"],
+                        additionalProperties: false
+                    ),
                 ],
                 required: ["title", "start", "end"],
                 additionalProperties: false
@@ -394,7 +423,8 @@ final class CalendarService: Service {
                 from: parsedStart.date,
                 isDateOnly: parsedStart.isDateOnly
             )
-            let endDate = calendar.normalizedStartDate(
+            // 与 events_fetch 语义一致：date-only 的 end 指向次日 00:00（包含整天）
+            let endDate = calendar.normalizedEndDate(
                 from: parsedEnd.date,
                 isDateOnly: parsedEnd.isDateOnly
             )
@@ -455,6 +485,80 @@ final class CalendarService: Service {
             // Set alarms
             if let alarms = self.parseAlarms(from: arguments) {
                 event.alarms = alarms
+            }
+
+            // Set recurrence rule
+            if case .object(let recurrenceConfig) = arguments["recurrence"] {
+                guard let frequencyStr = recurrenceConfig["frequency"]?.stringValue else {
+                    throw NSError(
+                        domain: "CalendarError",
+                        code: 4,
+                        userInfo: [NSLocalizedDescriptionKey: "Recurrence frequency is required"]
+                    )
+                }
+                let frequency = EKRecurrenceFrequency(frequencyStr)
+                let interval = recurrenceConfig["interval"]?.intValue ?? 1
+
+                var recurrenceEnd: EKRecurrenceEnd?
+                if case .string(let endStr) = recurrenceConfig["end"],
+                    let endDate = ISO8601DateFormatter.lenientDate(fromISO8601String: endStr)
+                {
+                    recurrenceEnd = EKRecurrenceEnd(end: endDate)
+                } else if case .int(let count) = recurrenceConfig["occurrenceCount"] {
+                    recurrenceEnd = EKRecurrenceEnd(occurrenceCount: count)
+                }
+
+                var daysOfWeek: [EKRecurrenceDayOfWeek]?
+                if case .array(let dayValues) = recurrenceConfig["daysOfWeek"] {
+                    daysOfWeek = dayValues.compactMap {
+                        guard case .int(let value) = $0, let weekday = EKWeekday(rawValue: value)
+                        else { return nil }
+                        return EKRecurrenceDayOfWeek(weekday)
+                    }
+                }
+
+                var daysOfMonth: [NSNumber]?
+                if case .array(let dayValues) = recurrenceConfig["daysOfMonth"] {
+                    daysOfMonth = dayValues.compactMap {
+                        guard case .int(let value) = $0, value >= 1, value <= 31 else { return nil }
+                        return NSNumber(value: value)
+                    }
+                }
+
+                let rule: EKRecurrenceRule
+                if let daysOfWeek, !daysOfWeek.isEmpty {
+                    rule = EKRecurrenceRule(
+                        recurrenceWith: frequency,
+                        interval: interval,
+                        daysOfTheWeek: daysOfWeek,
+                        daysOfTheMonth: nil,
+                        monthsOfTheYear: nil,
+                        weeksOfTheYear: nil,
+                        daysOfTheYear: nil,
+                        setPositions: nil,
+                        end: recurrenceEnd
+                    )
+                } else if let daysOfMonth, !daysOfMonth.isEmpty {
+                    rule = EKRecurrenceRule(
+                        recurrenceWith: frequency,
+                        interval: interval,
+                        daysOfTheWeek: nil,
+                        daysOfTheMonth: daysOfMonth,
+                        monthsOfTheYear: nil,
+                        weeksOfTheYear: nil,
+                        daysOfTheYear: nil,
+                        setPositions: nil,
+                        end: recurrenceEnd
+                    )
+                } else {
+                    rule = EKRecurrenceRule(
+                        recurrenceWith: frequency,
+                        interval: interval,
+                        end: recurrenceEnd
+                    )
+                }
+
+                event.addRecurrenceRule(rule)
             }
 
             // Save the event
@@ -643,7 +747,7 @@ final class CalendarService: Service {
                 )
             }
             if let endDate {
-                event.endDate = calendar.normalizedStartDate(
+                event.endDate = calendar.normalizedEndDate(
                     from: endDate,
                     isDateOnly: endIsDateOnly
                 )
