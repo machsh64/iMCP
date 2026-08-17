@@ -85,32 +85,29 @@ struct CheckboxToggleStyle: ToggleStyle {
 }
 
 @MainActor
-class ConnectionApprovalWindowController: NSObject {
-    private var window: NSWindow?
-    private var approvalView: ConnectionApprovalView?
+class ConnectionApprovalWindowController: NSObject, NSWindowDelegate {
+    /// 每个窗口独立的审批上下文，支持多个客户端并发审批
+    private final class ApprovalContext {
+        var onApprove: (Bool) -> Void
+        var onDeny: () -> Void
+        var hasResolved = false
+
+        init(onApprove: @escaping (Bool) -> Void, onDeny: @escaping () -> Void) {
+            self.onApprove = onApprove
+            self.onDeny = onDeny
+        }
+    }
+
+    private var windows: [NSWindow] = []
+    private var contexts: [ObjectIdentifier: ApprovalContext] = [:]
 
     func showApprovalWindow(
         clientName: String,
         onApprove: @escaping (Bool) -> Void,
         onDeny: @escaping () -> Void
     ) {
-        // Create the SwiftUI view
-        let approvalView = ConnectionApprovalView(
-            clientName: clientName,
-            onApprove: { alwaysTrust in
-                onApprove(alwaysTrust)
-                self.closeWindow()
-            },
-            onDeny: {
-                onDeny()
-                self.closeWindow()
-            }
-        )
+        let context = ApprovalContext(onApprove: onApprove, onDeny: onDeny)
 
-        // Create the hosting controller
-        let hostingController = NSHostingController(rootView: approvalView)
-
-        // Create the window with fixed size matching the SwiftUI view
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
             styleMask: [.titled, .closable],
@@ -119,41 +116,92 @@ class ConnectionApprovalWindowController: NSObject {
         )
 
         window.title = "Connection Request"
-        window.contentViewController = hostingController
         window.isReleasedWhenClosed = false
         window.level = .floating
         window.isMovableByWindowBackground = false
         window.titlebarAppearsTransparent = false
+        // 监听窗口关闭（用户点红色关闭按钮）→ 触发 deny
+        window.delegate = self
 
-        // Initial centering
-        window.center()
+        // 创建 SwiftUI 视图，按钮回调通过 resolve 统一处理
+        let approvalView = ConnectionApprovalView(
+            clientName: clientName,
+            onApprove: { [weak self, weak window] alwaysTrust in
+                guard let self, let window else { return }
+                self.resolve(
+                    window: window,
+                    context: context,
+                    approved: true,
+                    alwaysTrust: alwaysTrust
+                )
+            },
+            onDeny: { [weak self, weak window] in
+                guard let self, let window else { return }
+                self.resolve(
+                    window: window,
+                    context: context,
+                    approved: false,
+                    alwaysTrust: false
+                )
+            }
+        )
 
-        // Store references
-        self.window = window
-        self.approvalView = approvalView
+        window.contentViewController = NSHostingController(rootView: approvalView)
+
+        // Store references（每个窗口独立，互不覆盖）
+        windows.append(window)
+        contexts[ObjectIdentifier(window)] = context
+
+        // 每次弹出时平铺窗口，避免重叠
+        positionWindow(window, offsetBy: CGFloat(windows.count - 1) * 24)
 
         // Activate the app first
         NSApp.activate(ignoringOtherApps: true)
 
         // Show the window
         window.makeKeyAndOrderFront(nil)
-
-        // Center again after showing to ensure proper positioning
-        Task { @MainActor in
-            if let screen = NSScreen.main {
-                let screenRect = screen.visibleFrame
-                let windowRect = window.frame
-                let x = (screenRect.width - windowRect.width) / 2 + screenRect.origin.x
-                let y = (screenRect.height - windowRect.height) / 2 + screenRect.origin.y
-                window.setFrameOrigin(NSPoint(x: x, y: y))
-            }
-        }
     }
 
-    private func closeWindow() {
-        window?.close()
-        window = nil
-        approvalView = nil
+    /// 统一处理审批结果（按钮点击或窗口关闭）
+    private func resolve(
+        window: NSWindow,
+        context: ApprovalContext,
+        approved: Bool,
+        alwaysTrust: Bool
+    ) {
+        guard !context.hasResolved else { return }
+        context.hasResolved = true
+        if approved {
+            context.onApprove(alwaysTrust)
+        } else {
+            context.onDeny()
+        }
+        closeWindow(window)
+    }
+
+    /// 用户点击红色关闭按钮时触发（未通过按钮 resolve → 视为 Deny）
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+            let context = contexts[ObjectIdentifier(window)]
+        else { return }
+        resolve(window: window, context: context, approved: false, alwaysTrust: false)
+    }
+
+    private func closeWindow(_ window: NSWindow) {
+        window.close()
+        contexts.removeValue(forKey: ObjectIdentifier(window))
+        windows.removeAll { $0 === window }
+    }
+
+    /// 将窗口平铺居中定位，避免多窗口重叠
+    private func positionWindow(_ window: NSWindow, offsetBy offset: CGFloat) {
+        window.center()
+        guard let screen = NSScreen.main else { return }
+        let screenRect = screen.visibleFrame
+        let windowRect = window.frame
+        let x = (screenRect.width - windowRect.width) / 2 + screenRect.origin.x + offset
+        let y = (screenRect.height - windowRect.height) / 2 + screenRect.origin.y - offset
+        window.setFrameOrigin(NSPoint(x: x, y: y))
     }
 }
 

@@ -71,8 +71,9 @@ final class LocationService: NSObject, Service, CLLocationManagerDelegate {
                 self.authorizationContinuation = nil
             case .notDetermined:
                 // Need to request authorization
+                // macOS 只支持 Always 授权，请求 Always 以获得持续定位能力
                 log.debug("Requesting location access")
-                locationManager.requestWhenInUseAuthorization()
+                locationManager.requestAlwaysAuthorization()
             @unknown default:
                 // Handle unknown future cases
                 log.error("Unknown location authorization status")
@@ -102,6 +103,20 @@ final class LocationService: NSObject, Service, CLLocationManagerDelegate {
                 openWorldHint: false
             )
         ) { _ in
+            // 自动请求授权（如果尚未授权）。macOS 只支持 Always 授权。
+            let initialStatus = self.locationManager.authorizationStatus
+            if initialStatus != .authorizedAlways {
+                do {
+                    try await self.activate()
+                } catch {
+                    throw NSError(
+                        domain: "LocationServiceError",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Location access not authorized"]
+                    )
+                }
+            }
+
             return try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<GeoCoordinates, Error>) in
                 Task {

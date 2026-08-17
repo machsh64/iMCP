@@ -257,8 +257,10 @@ final class CaptureService: NSObject, Service {
                     continuation.resume(with: result)
                 }
 
+                // 超时时间需覆盖 delay（最大 60 秒）+ 15 秒余量，否则 delay > 10 时照片必然超时失败
+                let timeoutSeconds = min(delay + 15, 75)
                 let timeoutTask = Task {
-                    try await Task.sleep(for: .seconds(10))
+                    try await Task.sleep(for: .seconds(timeoutSeconds))
                     await resumeOnce(
                         .failure(
                             NSError(

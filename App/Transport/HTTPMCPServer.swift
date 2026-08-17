@@ -18,6 +18,7 @@ private let log = Logger.server
 actor HTTPMCPServer {
     private var listener: NWListener?
     private var pathMonitor: NWPathMonitor?
+    private var sessionCleanupTask: Task<Void, Never>?
     private var isRunning = false
     private var isListenerReady = false
     private var isRestarting = false
@@ -25,6 +26,15 @@ actor HTTPMCPServer {
     private let host: String
     private let endpoint: String
     private var apiKey: String
+
+    /// 请求头大小上限（64KB，防 slowloris）
+    private static let maxHeaderSize = 64 * 1024
+    /// 请求体大小上限（10MB）
+    private static let maxBodySize = 10 * 1024 * 1024
+    /// 整体读请求超时（30 秒）
+    private static let readTimeout: TimeInterval = 30
+    /// session 空闲过期时间（15 分钟）
+    private static let sessionIdleTimeout: TimeInterval = 15 * 60
 
     /// 用于创建 MCP.Server 的工厂闭包
     typealias ServerFactory = @Sendable (String, StatefulHTTPServerTransport) async -> MCP.Server
@@ -69,25 +79,60 @@ actor HTTPMCPServer {
 
         try createAndStartListener()
         startPathMonitoring()
+        startSessionCleanup()
         log.notice("HTTP MCP server started on \(self.host):\(self.port)\(self.endpoint)")
     }
 
     func stop() async {
         isRunning = false
+        sessionCleanupTask?.cancel()
+        sessionCleanupTask = nil
         pathMonitor?.cancel()
         pathMonitor = nil
         listener?.cancel()
         listener = nil
         isListenerReady = false
 
-        // 关闭所有 session
+        // 关闭所有 session 并释放底层资源
         for (sessionID, context) in sessions {
             await context.transport.disconnect()
+            await context.server.stop()
             log.debug("Closed HTTP MCP session: \(sessionID)")
         }
         sessions.removeAll()
 
         log.info("HTTP MCP server stopped")
+    }
+
+    // MARK: - Session 生命周期管理
+
+    /// 启动 session 空闲清理任务
+    private func startSessionCleanup() {
+        guard sessionCleanupTask == nil else { return }
+
+        sessionCleanupTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                await self?.evictExpiredSessions()
+            }
+        }
+    }
+
+    /// 驱逐超过空闲期限的 session，防止内存泄漏
+    private func evictExpiredSessions() async {
+        let now = Date()
+        let expired = sessions.filter {
+            now.timeIntervalSince($0.value.lastAccessedAt) > Self.sessionIdleTimeout
+        }
+
+        guard !expired.isEmpty else { return }
+
+        for (sessionID, context) in expired {
+            await context.transport.disconnect()
+            await context.server.stop()
+            sessions.removeValue(forKey: sessionID)
+            log.info("Evicted idle HTTP MCP session: \(sessionID)")
+        }
     }
 
     // MARK: - Listener 管理与网络恢复
@@ -221,8 +266,22 @@ actor HTTPMCPServer {
     }
 
     private func processHTTPConnection(_ connection: NWConnection) async throws {
-        // 读取完整的 HTTP 请求
-        let requestData = try await readHTTPRequest(connection)
+        // 读取完整的 HTTP 请求（带大小限制与超时）
+        let requestData: Data
+        do {
+            requestData = try await readHTTPRequest(connection)
+        } catch let error as HTTPReadError {
+            try await sendHTTPResponse(
+                connection,
+                statusCode: error.statusCode,
+                headers: ["Content-Type": "application/json"],
+                body: jsonErrorBody(code: -32700, message: error.message)
+            )
+            return
+        } catch {
+            log.debug("HTTP request read failed: \(error.localizedDescription)")
+            throw error
+        }
 
         guard let request = parseHTTPRequest(requestData) else {
             try await sendHTTPResponse(
@@ -266,9 +325,12 @@ actor HTTPMCPServer {
             let response = await session.transport.handleRequest(request)
             try await sendHTTPResponse(connection, response: response)
 
-            // DELETE 请求后清理 session
+            // DELETE 请求后清理 session 并释放底层资源
             if request.method.uppercased() == "DELETE" && response.statusCode == 200 {
+                await session.transport.disconnect()
+                await session.server.stop()
                 sessions.removeValue(forKey: sessionID)
+                log.info("Deleted HTTP MCP session: \(sessionID)")
             }
             return
         }
@@ -339,6 +401,31 @@ actor HTTPMCPServer {
 
     // MARK: - HTTP Read/Write Helpers
 
+    /// HTTP 读取错误
+    private enum HTTPReadError: Error {
+        case headersTooLarge
+        case bodyTooLarge
+        case timeout
+
+        var statusCode: Int {
+            switch self {
+            case .headersTooLarge, .bodyTooLarge: return 413
+            case .timeout: return 408
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .headersTooLarge:
+                return "Request headers too large"
+            case .bodyTooLarge:
+                return "Request body too large"
+            case .timeout:
+                return "Request timed out"
+            }
+        }
+    }
+
     /// 构建 JSON-RPC 错误响应体
     private func jsonErrorBody(code: Int, message: String) -> Data {
         // 转义 message 中的特殊 JSON 字符
@@ -354,49 +441,85 @@ actor HTTPMCPServer {
         return json.data(using: .utf8) ?? Data()
     }
 
-    /// 从连接中读取完整的 HTTP 请求数据
+    /// 从连接中读取完整的 HTTP 请求数据（带大小限制与超时）
     private func readHTTPRequest(_ connection: NWConnection) async throws -> Data {
-        var accumulatedData = Data()
-        let headerDelimiter = Data([0x0D, 0x0A, 0x0D, 0x0A])  // \r\n\r\n
-
-        // 先读取请求头
-        while true {
-            let chunk = try await readFromConnection(connection, maxLength: 4096)
-            guard !chunk.isEmpty else { break }
-            accumulatedData.append(chunk)
-
-            // 找到 header 结束标记
-            if accumulatedData.range(of: headerDelimiter) != nil {
-                break
+        return try await withThrowingTaskGroup(of: Data.self) { group in
+            // 整体读超时任务
+            group.addTask {
+                try? await Task.sleep(for: .seconds(Self.readTimeout))
+                throw HTTPReadError.timeout
             }
-        }
 
-        // 查找 Content-Length（如果 header 不完整则返回已有数据，由 parseHTTPRequest 返回 nil 处理）
-        guard let headerRange = accumulatedData.range(of: headerDelimiter) else {
-            return accumulatedData
-        }
-        let headerEnd = headerRange.upperBound
-        let headerData = accumulatedData[..<headerEnd]
-        let headerString = String(data: headerData, encoding: .utf8) ?? ""
+            // 实际读取任务
+            group.addTask {
+                var accumulatedData = Data()
+                let headerDelimiter = Data([0x0D, 0x0A, 0x0D, 0x0A])  // \r\n\r\n
 
-        var contentLength = 0
-        for line in headerString.components(separatedBy: "\r\n") {
-            if line.lowercased().hasPrefix("content-length:") {
-                let value = line.dropFirst(15).trimmingCharacters(in: .whitespaces)
-                contentLength = Int(value) ?? 0
+                // 先读取请求头（限制大小，防 slowloris）
+                while true {
+                    if accumulatedData.count > Self.maxHeaderSize {
+                        throw HTTPReadError.headersTooLarge
+                    }
+
+                    let chunk = try await self.readFromConnection(connection, maxLength: 4096)
+                    guard !chunk.isEmpty else { break }
+                    accumulatedData.append(chunk)
+
+                    // 找到 header 结束标记
+                    if accumulatedData.range(of: headerDelimiter) != nil {
+                        break
+                    }
+                }
+
+                // 查找 Content-Length（如果 header 不完整则返回已有数据，由 parseHTTPRequest 返回 nil 处理）
+                guard let headerRange = accumulatedData.range(of: headerDelimiter) else {
+                    return accumulatedData
+                }
+                let headerEnd = headerRange.upperBound
+                let headerData = accumulatedData[..<headerEnd]
+                let headerString = String(data: headerData, encoding: .utf8) ?? ""
+
+                var contentLength = 0
+                for line in headerString.components(separatedBy: "\r\n") {
+                    if line.lowercased().hasPrefix("content-length:") {
+                        let value = line.dropFirst(15).trimmingCharacters(in: .whitespaces)
+                        contentLength = Int(value) ?? 0
+                    }
+                }
+
+                // 请求体大小上限
+                guard contentLength <= Self.maxBodySize else {
+                    throw HTTPReadError.bodyTooLarge
+                }
+
+                // 读取 body（如果有）
+                var remainingBody = contentLength - (accumulatedData.count - headerEnd)
+                while remainingBody > 0 {
+                    let chunk = try await self.readFromConnection(
+                        connection,
+                        maxLength: max(remainingBody, 1024)
+                    )
+                    guard !chunk.isEmpty else { break }
+                    accumulatedData.append(chunk)
+                    remainingBody -= chunk.count
+                }
+
+                return accumulatedData
             }
-        }
 
-        // 读取 body（如果有）
-        var remainingBody = contentLength - (accumulatedData.count - headerEnd)
-        while remainingBody > 0 {
-            let chunk = try await readFromConnection(connection, maxLength: max(remainingBody, 1024))
-            guard !chunk.isEmpty else { break }
-            accumulatedData.append(chunk)
-            remainingBody -= chunk.count
-        }
+            // 返回第一个完成的结果（正常数据或超时错误）
+            do {
+                for try await result in group {
+                    group.cancelAll()
+                    return result
+                }
+            } catch {
+                group.cancelAll()
+                throw error
+            }
 
-        return accumulatedData
+            throw HTTPReadError.timeout
+        }
     }
 
     /// 从 NWConnection 读取数据
