@@ -17,7 +17,10 @@ private let log = Logger.server
 /// - SSE 流式响应
 actor HTTPMCPServer {
     private var listener: NWListener?
+    private var pathMonitor: NWPathMonitor?
     private var isRunning = false
+    private var isListenerReady = false
+    private var isRestarting = false
     private let port: Int
     private let host: String
     private let endpoint: String
@@ -64,6 +67,33 @@ actor HTTPMCPServer {
         guard !isRunning else { return }
         isRunning = true
 
+        try createAndStartListener()
+        startPathMonitoring()
+        log.notice("HTTP MCP server started on \(self.host):\(self.port)\(self.endpoint)")
+    }
+
+    func stop() async {
+        isRunning = false
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        listener?.cancel()
+        listener = nil
+        isListenerReady = false
+
+        // 关闭所有 session
+        for (sessionID, context) in sessions {
+            await context.transport.disconnect()
+            log.debug("Closed HTTP MCP session: \(sessionID)")
+        }
+        sessions.removeAll()
+
+        log.info("HTTP MCP server stopped")
+    }
+
+    // MARK: - Listener 管理与网络恢复
+
+    /// 创建并启动 NWListener
+    private func createAndStartListener() throws {
         let parameters = NWParameters.tcp
         parameters.acceptLocalOnly = false  // 允许局域网访问
         parameters.includePeerToPeer = false
@@ -82,19 +112,7 @@ actor HTTPMCPServer {
         self.listener = listener
 
         listener.stateUpdateHandler = { [weak self] state in
-            Task { @MainActor in
-                guard let self else { return }
-                switch state {
-                case .ready:
-                    log.info("HTTP MCP server ready on \(self.host):\(self.port)\(self.endpoint)")
-                case .failed(let error):
-                    log.error("HTTP MCP server failed: \(error.localizedDescription)")
-                case .cancelled:
-                    log.info("HTTP MCP server cancelled")
-                default:
-                    break
-                }
-            }
+            Task { await self?.handleListenerState(state) }
         }
 
         listener.newConnectionHandler = { [weak self] connection in
@@ -105,22 +123,81 @@ actor HTTPMCPServer {
         }
 
         listener.start(queue: .main)
-        log.notice("HTTP MCP server started on \(self.host):\(self.port)\(self.endpoint)")
     }
 
-    func stop() async {
-        isRunning = false
+    /// 处理 listener 状态变化
+    private func handleListenerState(_ state: NWListener.State) async {
+        switch state {
+        case .ready:
+            isListenerReady = true
+            log.info("HTTP MCP server ready on \(self.host):\(self.port)\(self.endpoint)")
+        case .waiting(let error):
+            isListenerReady = false
+            log.warning("HTTP MCP server waiting: \(error.localizedDescription)")
+        case .failed(let error):
+            isListenerReady = false
+            log.error("HTTP MCP server failed: \(error.localizedDescription)")
+            // 失败后立即尝试重启（网络恢复后也会再触发一次）
+            await restartListener()
+        case .cancelled:
+            isListenerReady = false
+            log.info("HTTP MCP server cancelled")
+        case .setup:
+            log.debug("HTTP MCP server setting up...")
+        @unknown default:
+            log.debug("HTTP MCP server unknown state")
+        }
+    }
+
+    /// 启动网络路径监控，检测断网重连
+    private func startPathMonitoring() {
+        guard pathMonitor == nil else { return }
+
+        let monitor = NWPathMonitor()
+        self.pathMonitor = monitor
+
+        monitor.pathUpdateHandler = { [weak self] path in
+            Task { await self?.handlePathUpdate(path) }
+        }
+
+        monitor.start(queue: .main)
+    }
+
+    /// 处理网络路径变化：网络恢复后自动重启 listener
+    private func handlePathUpdate(_ path: NWPath) async {
+        // 网络恢复且 listener 未就绪时，重启 listener
+        if path.status == .satisfied {
+            if isRunning, !isListenerReady {
+                log.info("Network path restored, restarting HTTP MCP listener")
+                await restartListener()
+            }
+        } else {
+            // 网络断开：主动标记 listener 未就绪，
+            // 即使 listener 未收到 .waiting/.failed 回调也能在恢复时重启
+            isListenerReady = false
+            log.warning("Network path unavailable")
+        }
+    }
+
+    /// 重启 listener（带防抖，避免并发重复重启）
+    private func restartListener() async {
+        guard isRunning, !isRestarting else { return }
+        isRestarting = true
+        defer { isRestarting = false }
+
         listener?.cancel()
         listener = nil
+        isListenerReady = false
 
-        // 关闭所有 session
-        for (sessionID, context) in sessions {
-            await context.transport.disconnect()
-            log.debug("Closed HTTP MCP session: \(sessionID)")
+        // 短暂等待旧 listener 完全释放端口
+        try? await Task.sleep(for: .milliseconds(300))
+
+        do {
+            try createAndStartListener()
+            log.notice("HTTP MCP listener restarted on \(self.host):\(self.port)")
+        } catch {
+            log.error("Failed to restart HTTP MCP listener: \(error.localizedDescription)")
         }
-        sessions.removeAll()
-
-        log.info("HTTP MCP server stopped")
     }
 
     func updateAPIKey(_ newKey: String) {
