@@ -216,7 +216,11 @@ final class CalendarService: Service {
                 events = events.filter { ($0.hasRecurrenceRules) == isRecurring }
             }
 
-            return events.map { Event($0) }
+            return events.map { event in
+                var eventValue = Event(event)
+                eventValue.identifier = event.eventIdentifier
+                return eventValue
+            }
         }
         Tool(
             name: "events_create",
@@ -449,91 +453,396 @@ final class CalendarService: Service {
             }
 
             // Set alarms
-            if case .array(let alarmConfigs) = arguments["alarms"] {
-                var alarms: [EKAlarm] = []
-
-                for alarmConfig in alarmConfigs {
-                    guard case .object(let config) = alarmConfig else { continue }
-
-                    var alarm: EKAlarm?
-
-                    let alarmType = config["type"]?.stringValue ?? "relative"
-                    switch alarmType {
-                    case "relative":
-                        if case .int(let minutes) = config["minutes"] {
-                            alarm = EKAlarm(relativeOffset: TimeInterval(-minutes * 60))
-                        }
-
-                    case "absolute":
-                        if case .string(let datetimeStr) = config["datetime"] {
-                            if ISO8601DateFormatter.isDateOnlyISO8601String(datetimeStr) {
-                                log.error(
-                                    "Absolute alarm datetime must include time component: \(datetimeStr, privacy: .public)"
-                                )
-                            } else if let absoluteDate = ISO8601DateFormatter.lenientDate(
-                                fromISO8601String: datetimeStr
-                            ) {
-                                alarm = EKAlarm(absoluteDate: absoluteDate)
-                            }
-                        }
-
-                    case "proximity":
-                        if case .string(let locationTitle) = config["locationTitle"],
-                            case .double(let latitude) = config["latitude"],
-                            case .double(let longitude) = config["longitude"]
-                        {
-                            alarm = EKAlarm()
-
-                            // Create structured location
-                            let structuredLocation = EKStructuredLocation(title: locationTitle)
-                            structuredLocation.geoLocation = CLLocation(
-                                latitude: latitude,
-                                longitude: longitude
-                            )
-
-                            if case .double(let radius) = config["radius"] {
-                                structuredLocation.radius = radius
-                            } else if case .int(let radiusInt) = config["radius"] {
-                                structuredLocation.radius = Double(radiusInt)
-                            }
-
-                            // Set proximity type
-                            let proximityType = config["proximity"]?.stringValue ?? "enter"
-                            let proximity: EKAlarmProximity =
-                                proximityType == "enter" ? .enter : .leave
-                            alarm?.proximity = proximity
-                            alarm?.structuredLocation = structuredLocation
-                        }
-
-                    default:
-                        log.error(
-                            "Unexpected alarm type encountered: \(alarmType, privacy: .public)"
-                        )
-                        continue
-                    }
-
-                    guard let alarm = alarm else { continue }
-
-                    if case .string(let soundName) = config["sound"],
-                        Sound(rawValue: soundName) != nil
-                    {
-                        alarm.soundName = soundName
-                    }
-
-                    if case .string(let email) = config["emailAddress"], !email.isEmpty {
-                        alarm.emailAddress = email
-                    }
-
-                    alarms.append(alarm)
-                }
-
+            if let alarms = self.parseAlarms(from: arguments) {
                 event.alarms = alarms
             }
 
             // Save the event
             try self.eventStore.save(event, span: .thisEvent)
 
-            return Event(event)
+            var eventValue = Event(event)
+            eventValue.identifier = event.eventIdentifier
+            return eventValue
         }
+
+        Tool(
+            name: "events_update",
+            description: "Update an existing calendar event by its identifier",
+            inputSchema: .object(
+                properties: [
+                    "eventId": .string(
+                        description: "The unique identifier of the event to update"
+                    ),
+                    "title": .string(),
+                    "start": .string(
+                        description:
+                            "Start date/time for the event. If timezone is omitted, local time is assumed. Date-only uses local midnight.",
+                        format: .dateTime
+                    ),
+                    "end": .string(
+                        description:
+                            "End date/time for the event. If timezone is omitted, local time is assumed. Date-only uses local midnight.",
+                        format: .dateTime
+                    ),
+                    "calendar": .string(
+                        description: "Calendar to move the event to"
+                    ),
+                    "location": .string(),
+                    "notes": .string(),
+                    "url": .string(
+                        format: .uri
+                    ),
+                    "isAllDay": .boolean(),
+                    "availability": .string(
+                        description: "Availability status",
+                        enum: EKEventAvailability.allCases.map { .string($0.stringValue) }
+                    ),
+                    "alarms": .array(
+                        description: "Alarm configurations for the event",
+                        items: .anyOf(
+                            [
+                                .object(
+                                    properties: [
+                                        "type": .string(
+                                            const: "relative",
+                                        ),
+                                        "minutes": .integer(
+                                            description:
+                                                "Minutes offset from event start (negative for before, positive for after)"
+                                        ),
+                                        "sound": .string(
+                                            description: "Sound name to play when alarm triggers",
+                                            enum: Sound.allCases.map { .string($0.rawValue) }
+                                        ),
+                                        "emailAddress": .string(),
+                                    ],
+                                    required: ["minutes"],
+                                    additionalProperties: false
+                                ),
+                                .object(
+                                    properties: [
+                                        "type": .string(
+                                            const: "absolute",
+                                        ),
+                                        "datetime": .string(
+                                            description:
+                                                "Alarm date/time. If timezone is omitted, local time is assumed.",
+                                            format: .dateTime
+                                        ),
+                                        "sound": .string(
+                                            enum: Sound.allCases.map { .string($0.rawValue) }
+                                        ),
+                                        "emailAddress": .string(),
+                                    ],
+                                    required: ["datetime"],
+                                    additionalProperties: false
+                                ),
+                                .object(
+                                    properties: [
+                                        "type": .string(
+                                            const: "proximity",
+                                        ),
+                                        "proximity": .string(
+                                            enum: ["enter", "leave"]
+                                        ),
+                                        "locationTitle": .string(),
+                                        "latitude": .number(),
+                                        "longitude": .number(),
+                                        "radius": .number(),
+                                        "sound": .string(
+                                            enum: Sound.allCases.map { .string($0.rawValue) }
+                                        ),
+                                        "emailAddress": .string(),
+                                    ],
+                                    required: ["locationTitle", "latitude", "longitude"],
+                                    additionalProperties: false
+                                ),
+                            ]
+                        )
+                    ),
+                    "span": .string(
+                        description:
+                            "Scope for recurring events: 'thisEvent' (default) or 'futureEvents'",
+                        enum: ["thisEvent", "futureEvents"]
+                    ),
+                ],
+                required: ["eventId"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Update Event",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            try await self.activate()
+
+            guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
+                log.error("Calendar access not authorized")
+                throw NSError(
+                    domain: "CalendarError",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Calendar access not authorized"]
+                )
+            }
+
+            // 查找事件
+            guard case .string(let eventId) = arguments["eventId"],
+                let event = self.eventStore.event(withIdentifier: eventId)
+            else {
+                throw NSError(
+                    domain: "CalendarError",
+                    code: 3,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Event not found. Provide a valid eventId from events_fetch."
+                    ]
+                )
+            }
+
+            // 解析 span
+            var span: EKSpan = .thisEvent
+            if case .string(let spanStr) = arguments["span"] {
+                span = EKSpan(spanStr)
+            }
+
+            // 更新 title
+            if case .string(let title) = arguments["title"] {
+                event.title = title
+            }
+
+            // 更新日期
+            var startDate: Date?
+            var endDate: Date?
+            var startIsDateOnly = false
+            var endIsDateOnly = false
+
+            if case .string(let startStr) = arguments["start"],
+                let parsedStart = ISO8601DateFormatter.parsedLenientISO8601Date(
+                    fromISO8601String: startStr
+                )
+            {
+                startDate = parsedStart.date
+                startIsDateOnly = parsedStart.isDateOnly
+            }
+
+            if case .string(let endStr) = arguments["end"],
+                let parsedEnd = ISO8601DateFormatter.parsedLenientISO8601Date(
+                    fromISO8601String: endStr
+                )
+            {
+                endDate = parsedEnd.date
+                endIsDateOnly = parsedEnd.isDateOnly
+            }
+
+            let calendar = Calendar.current
+            if let startDate {
+                event.startDate = calendar.normalizedStartDate(
+                    from: startDate,
+                    isDateOnly: startIsDateOnly
+                )
+            }
+            if let endDate {
+                event.endDate = calendar.normalizedStartDate(
+                    from: endDate,
+                    isDateOnly: endIsDateOnly
+                )
+            }
+
+            // 更新 all-day 标记
+            if case .bool(let isAllDay) = arguments["isAllDay"] {
+                event.isAllDay = isAllDay
+                if isAllDay {
+                    if let start = event.startDate {
+                        event.startDate = calendar.startOfDay(for: start)
+                    }
+                    if let end = event.endDate {
+                        event.endDate = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: end)
+                    }
+                }
+            }
+
+            // 更新 calendar
+            if case .string(let calendarName) = arguments["calendar"],
+                let matchingCalendar = self.eventStore.calendars(for: .event)
+                    .first(where: { $0.title.lowercased() == calendarName.lowercased() })
+            {
+                event.calendar = matchingCalendar
+            }
+
+            // 更新其他可选字段
+            if case .string(let location) = arguments["location"] {
+                event.location = location
+            }
+            if case .string(let notes) = arguments["notes"] {
+                event.notes = notes
+            }
+            if case .string(let urlString) = arguments["url"],
+                let url = URL(string: urlString)
+            {
+                event.url = url
+            }
+            if case .string(let availability) = arguments["availability"] {
+                event.availability = EKEventAvailability(availability)
+            }
+
+            // 更新 alarms
+            if let alarms = self.parseAlarms(from: arguments) {
+                event.alarms = alarms
+            }
+
+            // 保存修改
+            try self.eventStore.save(event, span: span)
+
+            var eventValue = Event(event)
+            eventValue.identifier = event.eventIdentifier
+            return eventValue
+        }
+
+        Tool(
+            name: "events_delete",
+            description: "Delete a calendar event by its identifier",
+            inputSchema: .object(
+                properties: [
+                    "eventId": .string(
+                        description: "The unique identifier of the event to delete"
+                    ),
+                    "span": .string(
+                        description:
+                            "Scope for recurring events: 'thisEvent' (default) or 'futureEvents'",
+                        enum: ["thisEvent", "futureEvents"]
+                    ),
+                ],
+                required: ["eventId"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Delete Event",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            try await self.activate()
+
+            guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
+                log.error("Calendar access not authorized")
+                throw NSError(
+                    domain: "CalendarError",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Calendar access not authorized"]
+                )
+            }
+
+            guard case .string(let eventId) = arguments["eventId"],
+                let event = self.eventStore.event(withIdentifier: eventId)
+            else {
+                throw NSError(
+                    domain: "CalendarError",
+                    code: 3,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Event not found. Provide a valid eventId from events_fetch."
+                    ]
+                )
+            }
+
+            var span: EKSpan = .thisEvent
+            if case .string(let spanStr) = arguments["span"] {
+                span = EKSpan(spanStr)
+            }
+
+            try self.eventStore.remove(event, span: span)
+
+            return Value.object([
+                "deleted": .bool(true),
+                "eventId": .string(eventId),
+            ])
+        }
+    }
+
+    // MARK: - 辅助方法
+
+    /// 从参数中解析 alarms 配置
+    private func parseAlarms(from arguments: [String: Value]) -> [EKAlarm]? {
+        guard case .array(let alarmConfigs) = arguments["alarms"] else {
+            return nil
+        }
+
+        var alarms: [EKAlarm] = []
+
+        for alarmConfig in alarmConfigs {
+            guard case .object(let config) = alarmConfig else { continue }
+
+            var alarm: EKAlarm?
+
+            let alarmType = config["type"]?.stringValue ?? "relative"
+            switch alarmType {
+            case "relative":
+                if case .int(let minutes) = config["minutes"] {
+                    alarm = EKAlarm(relativeOffset: TimeInterval(-minutes * 60))
+                }
+
+            case "absolute":
+                if case .string(let datetimeStr) = config["datetime"] {
+                    if ISO8601DateFormatter.isDateOnlyISO8601String(datetimeStr) {
+                        log.error(
+                            "Absolute alarm datetime must include time component: \(datetimeStr, privacy: .public)"
+                        )
+                    } else if let absoluteDate = ISO8601DateFormatter.lenientDate(
+                        fromISO8601String: datetimeStr
+                    ) {
+                        alarm = EKAlarm(absoluteDate: absoluteDate)
+                    }
+                }
+
+            case "proximity":
+                if case .string(let locationTitle) = config["locationTitle"],
+                    case .double(let latitude) = config["latitude"],
+                    case .double(let longitude) = config["longitude"]
+                {
+                    alarm = EKAlarm()
+
+                    let structuredLocation = EKStructuredLocation(title: locationTitle)
+                    structuredLocation.geoLocation = CLLocation(
+                        latitude: latitude,
+                        longitude: longitude
+                    )
+
+                    if case .double(let radius) = config["radius"] {
+                        structuredLocation.radius = radius
+                    } else if case .int(let radiusInt) = config["radius"] {
+                        structuredLocation.radius = Double(radiusInt)
+                    }
+
+                    let proximityType = config["proximity"]?.stringValue ?? "enter"
+                    let proximity: EKAlarmProximity =
+                        proximityType == "enter" ? .enter : .leave
+                    alarm?.proximity = proximity
+                    alarm?.structuredLocation = structuredLocation
+                }
+
+            default:
+                log.error(
+                    "Unexpected alarm type encountered: \(alarmType, privacy: .public)"
+                )
+                continue
+            }
+
+            guard let alarm = alarm else { continue }
+
+            if case .string(let soundName) = config["sound"],
+                Sound(rawValue: soundName) != nil
+            {
+                alarm.soundName = soundName
+            }
+
+            if case .string(let email) = config["emailAddress"], !email.isEmpty {
+                alarm.emailAddress = email
+            }
+
+            alarms.append(alarm)
+        }
+
+        return alarms
     }
 }

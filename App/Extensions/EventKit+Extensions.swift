@@ -74,3 +74,12 @@ extension EKReminderPriority {
         }
     }
 }
+
+extension EKSpan {
+    init(_ string: String) {
+        switch string.lowercased() {
+        case "future", "futureEvents": self = .futureEvents
+        default: self = .thisEvent
+        }
+    }
+}
